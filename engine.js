@@ -279,6 +279,8 @@
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
       });
       if (my !== gen) { stream.getTracks().forEach((t) => t.stop()); return false; }
+      // A context made without a tap (listening on launch) can start suspended; mic access lets it run.
+      if (c.state === "suspended") c.resume().catch(() => {});
       const mic = c.createMediaStreamSource(stream);
       mic.connect(an);
       if (opts.onAudio) {

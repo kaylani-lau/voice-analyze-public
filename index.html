@@ -22,6 +22,7 @@
   .wrap { max-width: 520px; margin: 0 auto; padding: 14px 0 28px; display: flex; flex-direction: column; gap: 12px; }
   .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   h1 { margin: 0; font-size: 18px; }
+  .version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   button, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 9px 14px; }
   button:disabled { opacity: .4; }
   #listen { background: var(--text); color: #000; font-weight: 600; min-width: 96px; }
@@ -50,9 +51,9 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="top"><h1>Voice Map</h1><button id="listen">● Start</button></div>
+  <div class="top"><div><h1>Voice Map</h1><small class="version">v2 · Oct 9</small></div><button id="listen">● Start</button></div>
   <canvas id="plane"></canvas>
-  <div><div id="now" class="muted">Tap Start and talk.</div><div class="small muted">Pitch <span id="pitch">–</span></div></div>
+  <div><div id="now" class="muted">Talk and the white dot shows where you are.</div><div class="small muted">Pitch <span id="pitch">–</span></div></div>
 
   <div class="card">
     <div style="font-weight:600;margin-bottom:8px">Record a labeled take</div>
@@ -112,13 +113,19 @@ async function retrain() {
 }
 
 // ---- one thing at a time: listening (mic), recording a take, or playing a take ----
-let listening = false, rec = null, playing = null, playTok = 0, resumeAfterPlay = false, wakeLock = null;
+let listening = false, rec = null, playing = null, playTok = 0, resumeAfterPlay = false, resumeOnReturn = false, wakeLock = null;
 const player = new Audio();
 async function startListening() {
   if (listening) return true;
   try {
     if (!(await VoiceEngine.start({ kind: "mic" }, onFrame, null, { onAudio }))) return false;
-  } catch (e) { setStatus("Couldn't use the mic: " + e.message); return false; }
+  } catch (e) {
+    const denied = e && (e.name === "NotAllowedError" || e.name === "SecurityError");
+    setStatus(denied ? "Microphone access was blocked. Allow it in the browser and tap Start." : "Couldn't use the mic: " + e.message);
+    return false;
+  }
+  // The app was left while the mic was opening; listen again on return instead.
+  if (document.visibilityState === "hidden") { VoiceEngine.stop(); resumeOnReturn = true; return false; }
   listening = true;
   try { wakeLock = navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch (e) { wakeLock = null; }
   render();
@@ -153,6 +160,19 @@ function stopPlay(resume = false) {
   if (again) startListening();
 }
 player.onended = () => stopPlay(true);
+// Nothing runs in the background: leaving the app (app switch, home screen, screen lock) saves any
+// recording and stops the mic and playback. Listening starts again on return unless Stop was pressed.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    const wasOn = listening || (playing && resumeAfterPlay);
+    if (playing) stopPlay();
+    if (listening) stopListening();
+    if (wasOn) resumeOnReturn = true;
+  } else if (resumeOnReturn) {
+    resumeOnReturn = false;
+    startListening();
+  }
+});
 
 // ---- live frames ----
 let recent = [], dot = null, trail = [], lastScore = -9, lastVoiced = -9, now = 0;
@@ -388,6 +408,9 @@ addEventListener("resize", size);
   size();
   render();
   if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("sw.js").catch(() => {});
+  // Start listening as soon as the app opens.
+  if (document.visibilityState === "visible") startListening();
+  else resumeOnReturn = true;
 })();
 </script>
 </body>

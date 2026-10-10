@@ -1,5 +1,5 @@
 // Offline support: use the network when online (so updates arrive), fall back to the cached copy offline.
-const CACHE = "voice-map-v1";
+const CACHE = "voice-map-v2";
 const FILES = ["./index.html", "./engine.js", "./model.js", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (event) => {
