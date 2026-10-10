@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Voice Map</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  /* Dark on true black, like Pitch Coach: black pixels are off on an OLED screen. */
+  :root {
+    --bg: #000; --text: #c9ced4; --muted: #6e767f; --border: #1f2226; --panel: #0d0e10;
+    --light-dark: #2fae7e; --light-bright: #4a8fe0; --heavy-dark: #d39a2c; --heavy-bright: #e2603c;
+    --zone: #0f2a17; --rec: #e0263a; --dot: #ffffff;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 0 14px env(safe-area-inset-bottom); }
+  .wrap { max-width: 520px; margin: 0 auto; padding: 14px 0 28px; display: flex; flex-direction: column; gap: 12px; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  h1 { margin: 0; font-size: 18px; }
+  button, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 9px 14px; }
+  button:disabled { opacity: .4; }
+  #listen { background: var(--text); color: #000; font-weight: 600; min-width: 96px; }
+  #listen.on { background: var(--panel); color: var(--text); }
+  .card { border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  #plane { width: 100%; aspect-ratio: 1 / 1; display: block; border-radius: 14px; border: 1px solid var(--border); touch-action: manipulation; }
+  #now { font-size: 17px; min-height: 24px; }
+  .quad { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .quad button { text-align: left; padding: 12px; line-height: 1.25; }
+  .quad button .n { display: block; color: var(--muted); font-size: 12px; }
+  .quad button.rec { background: var(--rec); border-color: var(--rec); color: #fff; }
+  .quad button.rec .n { color: #fff; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  #status { min-height: 20px; margin-top: 8px; font-size: 13px; }
+  details summary { cursor: pointer; font-weight: 600; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 9px 2px; border-top: 1px solid var(--border); font-size: 14px; }
+  .row .l2 { color: var(--muted); font-size: 12px; }
+  .row button { padding: 6px 11px; }
+  .row.playing { background: var(--panel); }
+  .line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .line select { flex: 1; min-width: 0; }
+  label { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><h1>Voice Map</h1><button id="listen">● Start</button></div>
+  <canvas id="plane"></canvas>
+  <div><div id="now" class="muted">Tap Start and talk.</div><div class="small muted">Pitch <span id="pitch">–</span></div></div>
+
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:8px">Record a labeled take</div>
+    <div class="quad" id="quad"></div>
+    <div id="status" class="muted">Tap a corner, do that voice, then pause. Tap again to stop.</div>
+    <div id="score" class="small" style="margin-top:6px"></div>
+  </div>
+
+  <details class="card" id="takesBox"><summary id="takesTitle">Takes</summary><div id="takes"></div></details>
+
+  <div class="card">
+    <div style="font-weight:600">Profile</div>
+    <div id="pstatus" class="small muted"></div>
+    <div class="line"><select id="plist" aria-label="Saved profiles"></select><button id="pload">Load</button><button id="psave">Save as…</button></div>
+    <label><input type="checkbox" id="tune"> Keep tuning as I record</label>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:600">Backup</div>
+    <div class="small muted">Takes and profiles live only in this browser on this device. Export to keep a copy or move them.</div>
+    <div class="line"><button id="export">Export</button><button id="import">Import</button><input type="file" id="importFile" accept="application/json,.json" hidden><button id="delall" style="margin-left:auto;color:var(--rec)">Delete all takes</button></div>
+  </div>
+</div>
+<script src="engine.js"></script>
+<script src="model.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const QUADS = [
+  { label: "light + dark", color: "--light-dark" }, { label: "light + bright", color: "--light-bright" },
+  { label: "heavy + dark", color: "--heavy-dark" }, { label: "heavy + bright", color: "--heavy-bright" },
+];
+const colorOf = (label) => getComputedStyle(document.documentElement).getPropertyValue(QUADS.find((q) => q.label === label).color).trim();
+const readsAs = (p) => `${p.y > 0 ? "light" : "heavy"} + ${p.x > 0 ? "bright" : "dark"}`;
+
+// ---- storage: IndexedDB "takes" (with the WAV blob) and "kv" (model, profiles, settings) ----
+let db;
+const req = (r) => new Promise((ok, no) => { r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); });
+function openDb() {
+  const r = indexedDB.open("voice-map", 1);
+  r.onupgradeneeded = () => { r.result.createObjectStore("takes", { keyPath: "id" }); r.result.createObjectStore("kv"); };
+  return req(r);
+}
+const store = (name, mode = "readonly") => db.transaction(name, mode).objectStore(name);
+const kvGet = (k) => req(store("kv").get(k));
+const kvSet = (k, v) => req(store("kv", "readwrite").put(v, k));
+
+let takes = [], model = null, profiles = [];
+const plain = (t) => ({ id: t.id, label: t.label, createdAt: t.createdAt, features: t.features });
+const scoreOf = (t) => (model ? VoiceModel.score(model, t.features) : null);
+async function setModel(m) { model = m; await kvSet("model", m); }
+async function retrain() {
+  const m = VoiceModel.train(takes.map(plain));
+  if (m.error) { await setModel(null); render(); return m.error; }
+  await setModel({ ...m, profile: null });
+  render();
+  return null;
+}
+
+// ---- one thing at a time: listening (mic), recording a take, or playing a take ----
+let listening = false, rec = null, playing = null, playTok = 0, resumeAfterPlay = false, wakeLock = null;
+const player = new Audio();
+async function startListening() {
+  if (listening) return true;
+  try {
+    if (!(await VoiceEngine.start({ kind: "mic" }, onFrame, null, { onAudio }))) return false;
+  } catch (e) { setStatus("Couldn't use the mic: " + e.message); return false; }
+  listening = true;
+  try { wakeLock = navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch (e) { wakeLock = null; }
+  render();
+  return true;
+}
+function stopListening() {
+  if (rec) finishRec();
+  VoiceEngine.stop();
+  listening = false;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  render();
+}
+$("listen").onclick = () => (listening ? stopListening() : (stopPlay(), startListening()));
+
+function playTake(t) {
+  if (playing === t.id) { stopPlay(true); return; }
+  resumeAfterPlay = resumeAfterPlay || listening;
+  if (listening) stopListening();
+  if (player.src) URL.revokeObjectURL(player.src);
+  playing = t.id;
+  player.src = URL.createObjectURL(t.wav);
+  const tok = ++playTok;
+  player.play().catch((e) => { if (tok === playTok && e.name !== "AbortError") { setStatus("Couldn't play: " + e.message); stopPlay(); } });
+  render();
+}
+// After a take finishes, go back to listening if the mic was on before it started.
+function stopPlay(resume = false) {
+  playTok++; player.pause(); playing = null;
+  const again = resume && resumeAfterPlay;
+  resumeAfterPlay = false;
+  render();
+  if (again) startListening();
+}
+player.onended = () => stopPlay(true);
+
+// ---- live frames ----
+let recent = [], dot = null, trail = [], lastScore = -9, lastVoiced = -9, now = 0;
+function onFrame(fr) {
+  now = fr.t;
+  if (rec) recTick(fr);
+  if (fr.voiced) {
+    lastVoiced = fr.t;
+    recent.push(fr);
+    while (recent[0].t < fr.t - 2) recent.shift();
+    if (model && recent.length >= 8 && fr.t - lastScore > 0.1) {
+      lastScore = fr.t;
+      dot = VoiceModel.score(model, VoiceModel.featuresOf(recent));
+      trail.push({ t: fr.t, ...dot });
+      $("now").innerHTML = `Now: <b>${readsAs(dot)}</b>`;
+      $("now").className = "";
+    }
+  }
+  while (trail.length && trail[0].t < now - 3) trail.shift();
+  $("pitch").textContent = fr.voiced ? fr.f0.toFixed(0) + " Hz" : "–";
+  draw();
+}
+
+// ---- recording ----
+function onAudio(chunk, sr) { if (rec) { rec.audio.push(chunk); rec.sr = sr; } }
+async function startRec(label) {
+  if (rec) finishRec();
+  if (playing) stopPlay();
+  if (!(await startListening())) return;
+  rec = { label, frames: [], audio: [], sr: 48000, voiced: 0, silent: 0, lastT: null };
+  setStatus(`● Recording <b>${label}</b>. Do that voice, then pause.`);
+  render();
+}
+function recTick(fr) {
+  rec.frames.push(fr);
+  const dt = rec.lastT == null ? 0 : Math.max(0, fr.t - rec.lastT);
+  rec.lastT = fr.t;
+  if (fr.voiced) { rec.voiced += dt; rec.silent = 0; } else rec.silent += dt;
+  if (rec.voiced > 1 && rec.silent > 1.2) finishRec();
+}
+async function finishRec() {
+  const r = rec;
+  rec = null;
+  render();
+  if (!r) return;
+  if (r.voiced < 0.5) { setStatus(`Nothing saved: only ${r.voiced.toFixed(1)} s of voice.`); return; }
+  const createdAt = new Date().toISOString();
+  const t = { id: createdAt.replace(/\D/g, "").slice(0, 14) + "-" + r.label.replace(/\W+/g, "-"), label: r.label, createdAt, voicedSec: r.voiced, features: VoiceModel.featuresOf(r.frames), wav: new Blob([wavBytes(r.audio, r.sr)], { type: "audio/wav" }) };
+  await req(store("takes", "readwrite").put(t));
+  takes.push(t);
+  const gone = await trim();
+  let note = "";
+  if ($("tune").checked || !model) note = (await retrain()) || "";
+  const p = scoreOf(t);
+  setStatus(`Saved <b>${t.label}</b> ✓. ` + (note || (p ? (readsAs(p) === t.label ? "The map agrees." : `The map reads it as ${readsAs(p)} for now; your label is kept.`) : "")) + trimNote(gone));
+  render();
+}
+function wavBytes(chunks, sr) {
+  const n = chunks.reduce((s, c) => s + c.length, 0), buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const str = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of chunks) for (let i = 0; i < c.length; i++, o += 2) v.setInt16(o, Math.max(-1, Math.min(1, c[i])) * 32767, true);
+  return buf;
+}
+const setStatus = (h) => ($("status").innerHTML = h);
+
+// Keeps the newest MAX_TAKES takes; anything older is deleted.
+const MAX_TAKES = 50;
+async function trim() {
+  const gone = takes.slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(0, Math.max(0, takes.length - MAX_TAKES));
+  for (const old of gone) {
+    if (playing === old.id) stopPlay();
+    await req(store("takes", "readwrite").delete(old.id));
+  }
+  takes = takes.filter((t) => !gone.includes(t));
+  return gone;
+}
+const trimNote = (gone) => (gone.length === 1 ? ` Removed the oldest take (${gone[0].label}) to stay at ${MAX_TAKES}.` : gone.length ? ` Removed the ${gone.length} oldest takes to stay at ${MAX_TAKES}.` : "");
+
+async function removeTake(id) {
+  if (playing === id) stopPlay();
+  await req(store("takes", "readwrite").delete(id));
+  takes = takes.filter((t) => t.id !== id);
+  if ($("tune").checked) await retrain(); else render();
+}
+
+// ---- profiles ----
+$("psave").onclick = async () => {
+  if (!model) return;
+  const name = (prompt("Name this profile:", model.profile || "") || "").trim();
+  if (!name) return;
+  profiles = profiles.filter((p) => p.name !== name).concat({ name, savedAt: new Date().toISOString(), model: { ...model, profile: name } });
+  await kvSet("profiles", profiles);
+  await setModel({ ...model, profile: name });
+  render();
+};
+$("pload").onclick = async () => {
+  const p = profiles.find((p) => p.name === $("plist").value);
+  if (!p) return;
+  $("tune").checked = false; await kvSet("tune", false);
+  await setModel({ ...p.model, profile: p.name });
+  render();
+};
+$("tune").onchange = async () => { await kvSet("tune", $("tune").checked); if ($("tune").checked) { const e = await retrain(); if (e) setStatus(e); } else render(); };
+
+// ---- backup ----
+const toDataUrl = (blob) => new Promise((ok) => { const f = new FileReader(); f.onload = () => ok(f.result); f.readAsDataURL(blob); });
+$("export").onclick = async () => {
+  const data = { app: "voice-map", version: 1, exportedAt: new Date().toISOString(), profiles, takes: [] };
+  for (const t of takes) data.takes.push({ ...plain(t), voicedSec: t.voicedSec, wav: t.wav ? await toDataUrl(t.wav) : null });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: "application/json" }));
+  a.download = `voice-map-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+};
+$("import").onclick = () => $("importFile").click();
+$("importFile").onchange = async (e) => {
+  const f = e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    if (data.app !== "voice-map") throw new Error("not a Voice Map export");
+    let added = 0;
+    for (const x of data.takes || []) {
+      if (takes.some((t) => t.id === x.id)) continue;
+      const t = { ...x, wav: x.wav ? await (await fetch(x.wav)).blob() : null };
+      await req(store("takes", "readwrite").put(t));
+      takes.push(t); added++;
+    }
+    for (const p of data.profiles || []) if (!profiles.some((q) => q.name === p.name)) profiles.push(p);
+    await kvSet("profiles", profiles);
+    const gone = await trim();
+    setStatus(`Imported ${added} take${added === 1 ? "" : "s"}.` + trimNote(gone));
+    if ($("tune").checked || !model) { const err = await retrain(); if (err) setStatus(err); } else render();
+  } catch (err) { setStatus("Couldn't import: " + err.message); }
+};
+$("delall").onclick = async () => {
+  if (!takes.length || !confirm(`Delete all ${takes.length} takes from this device? Export first if you want a copy.`)) return;
+  if (playing) stopPlay();
+  await req(store("takes", "readwrite").clear());
+  takes = [];
+  await setModel(null);
+  render();
+};
+
+// ---- rendering ----
+function nameOf(t) { return `${t.label} #${takes.filter((x) => x.label === t.label).indexOf(t) + 1}`; }
+function render() {
+  $("listen").textContent = listening ? "■ Stop" : "● Start";
+  $("listen").classList.toggle("on", listening);
+  $("quad").innerHTML = QUADS.map((q) => {
+    const n = takes.filter((t) => t.label === q.label).length, on = rec && rec.label === q.label;
+    return `<button data-q="${q.label}" class="${on ? "rec" : ""}"><span class="sw" style="background:var(${q.color})"></span>${on ? "● stop" : q.label}<span class="n">${n} take${n === 1 ? "" : "s"}</span></button>`;
+  }).join("");
+  document.querySelectorAll("[data-q]").forEach((b) => (b.onclick = () => (rec && rec.label === b.dataset.q ? finishRec() : startRec(b.dataset.q))));
+  if (model) {
+    const a = model.axes, by = a.weight.test.by === "session" ? "on sessions it didn't learn from" : "on takes it didn't learn from (one session so far, so optimistic)";
+    $("score").innerHTML = `<b>How often it's right</b> <span class="muted">${by}</span><br>Weight ${a.weight.test.ok}/${a.weight.test.n} · Brightness ${a.brightness.test.ok}/${a.brightness.test.n}`;
+  } else $("score").innerHTML = `<span class="muted">The map starts working after 2 takes on each side: light and heavy, bright and dark.</span>`;
+  const sorted = takes.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  $("takesTitle").textContent = `Takes (${takes.length} of ${MAX_TAKES})`;
+  $("takes").innerHTML = `<div class="small muted" style="padding:6px 0 8px">Keeps your newest ${MAX_TAKES}. When full, each new take replaces the oldest one.</div>` + sorted.map((t) => {
+    const p = scoreOf(t), reads = !p ? "" : readsAs(p) === t.label ? "map agrees ✓" : `map reads ${readsAs(p)}`;
+    const when = new Date(t.createdAt).toLocaleString([], { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" });
+    return `<div class="row${playing === t.id ? " playing" : ""}"><div><span class="sw" style="background:${colorOf(t.label)}"></span>${nameOf(t)}<div class="l2">${when}${t.voicedSec ? ` · ${t.voicedSec.toFixed(1)} s` : ""}${reads ? " · " + reads : ""}</div></div>
+      <div>${t.wav ? `<button data-play="${t.id}">${playing === t.id ? "■" : "▶"}</button>` : ""} <button data-del="${t.id}" aria-label="Delete">✕</button></div></div>`;
+  }).join("") || `<div class="small muted" style="padding-top:8px">No takes yet.</div>`;
+  document.querySelectorAll("[data-play]").forEach((b) => (b.onclick = () => playTake(takes.find((t) => t.id === b.dataset.play))));
+  document.querySelectorAll("[data-del]").forEach((b) => (b.onclick = () => { const t = takes.find((x) => x.id === b.dataset.del); if (confirm(`Delete ${nameOf(t)}?`)) removeTake(t.id); }));
+  $("plist").innerHTML = profiles.length ? profiles.map((p) => `<option${model && model.profile === p.name ? " selected" : ""}>${p.name}</option>`).join("") : `<option value="">no saved profiles yet</option>`;
+  $("pload").disabled = !profiles.length;
+  $("psave").disabled = !model;
+  $("pstatus").textContent = !model ? "Not trained yet." : model.profile ? `Using ${model.profile}${$("tune").checked ? " (and still tuning)" : ""}` : `Unsaved tuning from ${model.trainedOn} takes`;
+  draw();
+}
+
+// ---- map ----
+const cv = $("plane"), ctx = cv.getContext("2d");
+let W = 0, D = 1.6;
+const P = 18, px = (v) => P + (W - 2 * P) * (Math.max(-D, Math.min(D, v)) + D) / (2 * D), py = (v) => W - px(v);
+function size() { const d = devicePixelRatio || 1; W = cv.clientWidth; cv.width = W * d; cv.height = W * d; ctx.setTransform(d, 0, 0, d, 0, 0); draw(); }
+function placed() { return model ? takes.map((t) => ({ t, ...scoreOf(t) })) : []; }
+function draw() {
+  if (!W) return;
+  const pts = placed();
+  D = Math.max(1.6, ...pts.map((p) => Math.max(Math.abs(p.x), Math.abs(p.y)) * 1.15));
+  ctx.clearRect(0, 0, W, W);
+  ctx.fillStyle = "#0d0e10"; ctx.fillRect(P, P, W - 2 * P, W - 2 * P);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--zone"); ctx.fillRect(px(0), P, W - P - px(0), px(0) - P);
+  ctx.strokeStyle = "#3a3f45"; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(px(0), P); ctx.lineTo(px(0), W - P); ctx.moveTo(P, py(0)); ctx.lineTo(W - P, py(0)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.font = "11px -apple-system, system-ui, sans-serif"; ctx.fillStyle = "#6e767f";
+  ctx.fillText("light + dark", P + 6, P + 14); ctx.fillText("light + bright", W - P - 74, P + 14);
+  ctx.fillText("heavy + dark", P + 6, W - P - 6); ctx.fillText("heavy + bright", W - P - 80, W - P - 6);
+  if (!model) { ctx.fillStyle = "#6e767f"; ctx.font = "13px -apple-system, system-ui, sans-serif"; ctx.fillText("Record takes in each corner to train the map", W / 2 - 132, W / 2); }
+  for (const p of pts) {
+    ctx.fillStyle = colorOf(p.t.label); ctx.beginPath(); ctx.arc(px(p.x), py(p.y), 5, 0, 7); ctx.fill();
+    if (p.t.id === playing) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px(p.x), py(p.y), 11, 0, 7); ctx.stroke(); }
+  }
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+  for (let i = 1; i < trail.length; i++) {
+    const a = trail[i - 1], b = trail[i];
+    if (b.t - a.t > 0.4) continue;
+    ctx.globalAlpha = 0.1 + 0.5 * (1 - (now - b.t) / 3);
+    ctx.beginPath(); ctx.moveTo(px(a.x), py(a.y)); ctx.lineTo(px(b.x), py(b.y)); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  if (dot && listening) {
+    ctx.globalAlpha = Math.max(0.2, 1 - Math.max(0, now - lastVoiced - 0.15) / 0.8);
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(px(dot.x), py(dot.y), 8, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+  }
+  if (rec) { ctx.fillStyle = "#e0263a"; ctx.font = "600 13px -apple-system, system-ui, sans-serif"; ctx.fillText(`● recording ${rec.label}`, P + 6, P + 32); }
+}
+// Tapping a take's dot plays it.
+cv.addEventListener("click", (e) => {
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  let hit = null, best = 22;
+  for (const p of placed()) { const d = Math.hypot(px(p.x) - mx, py(p.y) - my); if (d < best) { best = d; hit = p.t; } }
+  if (hit && hit.wav) playTake(hit);
+});
+addEventListener("resize", size);
+
+(async () => {
+  db = await openDb();
+  takes = await req(store("takes").getAll());
+  model = (await kvGet("model")) || null;
+  profiles = (await kvGet("profiles")) || [];
+  const tune = await kvGet("tune");
+  $("tune").checked = tune == null ? true : tune;
+  size();
+  render();
+  if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("sw.js").catch(() => {});
+})();
+</script>
+</body>
+</html>
